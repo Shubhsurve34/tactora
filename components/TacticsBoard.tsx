@@ -1,73 +1,114 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   type Board,
-  type DrawKind,
   type Drawing,
+  type DrawKind,
+  type Overlays,
   type Team,
   type Tool,
+  type XY,
+  type Zone,
+  type ZoneKind,
   FORMATION_NAMES,
+  MAX_STEPS,
   PITCH_H,
   PITCH_W,
   TEAM_COLORS,
+  addStep,
   applyFormation,
   clampX,
   clampY,
   decodeBoard,
   defaultBoard,
   encodeBoard,
+  frameAt,
+  moveBall,
+  movePlayer,
+  removeStep,
 } from "@/lib/board";
+import { download, drawCaption, recordVideo, slug, svgToImage, timelineAt, timelineLength, videoFormat } from "@/lib/export";
+import { PAD, Pitch } from "./Pitch";
+import { AnalysisPanel } from "./AnalysisPanel";
+import { useAnalysis } from "./useAnalysis";
 
 const STORAGE_KEY = "tactora:board";
-const HISTORY_LIMIT = 60;
-const PAD = 4;
+const HISTORY_LIMIT = 80;
 
 type Drag =
   | { kind: "player"; id: string; dx: number; dy: number; moved: boolean; startX: number; startY: number }
   | { kind: "ball"; dx: number; dy: number; moved: boolean }
-  | { kind: "draw"; draw: DrawKind; x1: number; y1: number };
+  | { kind: "draw"; draw: DrawKind; x1: number; y1: number }
+  | { kind: "zone"; zone: ZoneKind; x1: number; y1: number }
+  | { kind: "mark"; from: string };
 
-/** Ink or white text, whichever reads better on a shirt colour. */
-function textOn(hex: string): string {
-  const n = parseInt(hex.slice(1), 16);
-  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-  return 0.299 * r + 0.587 * g + 0.114 * b > 150 ? "#16201b" : "#ffffff";
-}
+const TOOLS: [Tool, string, string, string][] = [
+  ["move", "Move", "V", "Drag players and the ball. Tap a player to rename them."],
+  ["run", "Run", "R", "Drag on the pitch to draw a run for this step."],
+  ["pass", "Pass", "P", "Drag on the pitch to draw a pass for this step."],
+  ["press", "Press", "Z", "Drag a box where your team should press."],
+  ["space", "Space", "S", "Drag a box over space to attack."],
+  ["mark", "Mark", "M", "Drag from a player to the opponent they mark."],
+  ["erase", "Erase", "E", "Tap a line, zone or marking link to remove it."],
+];
 
 let idCounter = 0;
-const newId = () => `d${Date.now().toString(36)}${(idCounter++).toString(36)}`;
+const newId = (p: string) => `${p}${Date.now().toString(36)}${(idCounter++).toString(36)}`;
 
 export function TacticsBoard() {
   const [board, setBoard] = useState<Board>(defaultBoard);
+  const [step, setStep] = useState(0);
   const [tool, setTool] = useState<Tool>("move");
   const [selected, setSelected] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Drawing | null>(null);
+  const [draftLine, setDraftLine] = useState<Drawing | null>(null);
+  const [draftZone, setDraftZone] = useState<Zone | null>(null);
+  const [draftMark, setDraftMark] = useState<{ from: string; x: number; y: number } | null>(null);
+  const [playT, setPlayT] = useState<number | null>(null);
+  const [speed, setSpeed] = useState(1);
+  const [loop, setLoop] = useState(false);
+  const [recording, setRecording] = useState<number | null>(null);
+  const [tab, setTab] = useState<"teams" | "analysis">("teams");
   const [toast, setToast] = useState("");
   const [canUndo, setCanUndo] = useState(false);
   const [loaded, setLoaded] = useState(false);
-
   const [vertical, setVertical] = useState(false);
+
   const svgRef = useRef<SVGSVGElement>(null);
   const fieldRef = useRef<SVGGElement>(null);
   const dragRef = useRef<Drag | null>(null);
-  const historyRef = useRef<Board[]>([]);
+  const historyRef = useRef<{ board: Board; step: number }[]>([]);
   const boardRef = useRef(board);
+  const stepRef = useRef(step);
   const toastTimer = useRef<number | undefined>(undefined);
+  const playRef = useRef<{ raf: number; start: number } | null>(null);
 
   useEffect(() => {
     boardRef.current = board;
-  }, [board]);
+    stepRef.current = step;
+  }, [board, step]);
+
+  const steps = board.frames.length;
+  const playing = playT !== null;
+  const frame = useMemo(
+    () => (playT !== null ? frameAt(board, playT) : board.frames[Math.min(step, steps - 1)]),
+    [board, playT, step, steps],
+  );
+  const shownStep = playT !== null ? Math.min(steps - 1, Math.floor(playT)) : step;
+  const prevFrame = playT === null && step > 0 ? board.frames[step - 1] : null;
+  const analysis = useAnalysis(board, frame);
 
   const say = useCallback((message: string) => {
     setToast(message);
     window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(""), 2600);
+    toastTimer.current = window.setTimeout(() => setToast(""), 2800);
   }, []);
 
-  /** Record the current board so the next change can be undone. */
+  /* History ---------------------------------------------------------------- */
+
   const remember = useCallback(() => {
-    historyRef.current.push(boardRef.current);
+    historyRef.current.push({ board: boardRef.current, step: stepRef.current });
     if (historyRef.current.length > HISTORY_LIMIT) historyRef.current.shift();
     setCanUndo(true);
   }, []);
@@ -83,12 +124,62 @@ export function TacticsBoard() {
   const undo = useCallback(() => {
     const prev = historyRef.current.pop();
     if (!prev) return;
-    setBoard(prev);
+    setBoard(prev.board);
+    setStep(Math.min(prev.step, prev.board.frames.length - 1));
     setCanUndo(historyRef.current.length > 0);
     setSelected(null);
   }, []);
 
-  // Phones get an upright pitch so players are big enough to drag.
+  /* Playback --------------------------------------------------------------- */
+
+  const stop = useCallback(() => {
+    if (playRef.current) cancelAnimationFrame(playRef.current.raf);
+    playRef.current = null;
+    setPlayT(null);
+  }, []);
+
+  const play = useCallback(() => {
+    const total = boardRef.current.frames.length;
+    if (total < 2) {
+      say("Add a second step to play the move.");
+      return;
+    }
+    if (playRef.current) cancelAnimationFrame(playRef.current.raf);
+    setSelected(null);
+    const state = { raf: 0, start: performance.now() };
+    playRef.current = state;
+    const tick = (now: number) => {
+      if (playRef.current !== state) return;
+      const n = boardRef.current.frames.length;
+      const length = timelineLength(n, speed);
+      let elapsed = now - state.start;
+      if (elapsed >= length) {
+        if (loop) {
+          state.start = now;
+          elapsed = 0;
+        } else {
+          playRef.current = null;
+          setPlayT(null);
+          setStep(n - 1);
+          return;
+        }
+      }
+      setPlayT(timelineAt(elapsed, n, speed));
+      state.raf = requestAnimationFrame(tick);
+    };
+    state.raf = requestAnimationFrame(tick);
+    setPlayT(0);
+  }, [loop, say, speed]);
+
+  useEffect(
+    () => () => {
+      if (playRef.current) cancelAnimationFrame(playRef.current.raf);
+    },
+    [],
+  );
+
+  /* Load, save, layout ----------------------------------------------------- */
+
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 640px)");
     const sync = () => setVertical(mq.matches);
@@ -97,7 +188,6 @@ export function TacticsBoard() {
     return () => mq.removeEventListener("change", sync);
   }, []);
 
-  // Load: a shared link wins, then the last board on this device.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -115,7 +205,10 @@ export function TacticsBoard() {
         }
       }
       if (cancelled) return;
-      if (next) setBoard(next);
+      if (next) {
+        setBoard(next);
+        if (match && next.frames.length > 1) say(`This move has ${next.frames.length} steps. Press play to watch it.`);
+      }
       setLoaded(true);
     })();
     return () => {
@@ -123,20 +216,51 @@ export function TacticsBoard() {
     };
   }, [say]);
 
-  // Autosave on this device.
   useEffect(() => {
     if (!loaded) return;
     const id = window.setTimeout(async () => {
       try {
         window.localStorage.setItem(STORAGE_KEY, await encodeBoard(board));
       } catch {
-        // private mode or full storage: nothing to do
+        // private mode or full storage
       }
     }, 400);
     return () => window.clearTimeout(id);
   }, [board, loaded]);
 
-  // Keyboard: undo, tool shortcuts, Escape.
+  /* Steps ------------------------------------------------------------------ */
+
+  const goTo = useCallback(
+    (i: number) => {
+      stop();
+      setSelected(null);
+      setStep(Math.max(0, Math.min(boardRef.current.frames.length - 1, i)));
+    },
+    [stop],
+  );
+
+  const newStep = useCallback(() => {
+    stop();
+    if (boardRef.current.frames.length >= MAX_STEPS) {
+      say(`A move can have up to ${MAX_STEPS} steps.`);
+      return;
+    }
+    const at = stepRef.current;
+    change((b) => addStep(b, at));
+    setStep(at + 1);
+    say(`Step ${at + 2} added. Move players to show what happens next.`);
+  }, [change, say, stop]);
+
+  const deleteStep = useCallback(() => {
+    stop();
+    if (boardRef.current.frames.length <= 1) return;
+    const at = stepRef.current;
+    change((b) => removeStep(b, at));
+    setStep(Math.max(0, at - 1));
+  }, [change, stop]);
+
+  /* Keyboard --------------------------------------------------------------- */
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null;
@@ -147,11 +271,18 @@ export function TacticsBoard() {
         return;
       }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === " ") {
+        e.preventDefault();
+        if (playRef.current) stop();
+        else play();
+        return;
+      }
+      if (e.key === "ArrowRight") return goTo(stepRef.current + 1);
+      if (e.key === "ArrowLeft") return goTo(stepRef.current - 1);
       const key = e.key.toLowerCase();
-      if (key === "v") setTool("move");
-      else if (key === "r") setTool("run");
-      else if (key === "p") setTool("pass");
-      else if (key === "e") setTool("erase");
+      if (key === "n") return newStep();
+      const found = TOOLS.find(([, , k]) => k.toLowerCase() === key);
+      if (found) setTool(found[0]);
       else if (key === "escape") {
         setSelected(null);
         setTool("move");
@@ -159,41 +290,63 @@ export function TacticsBoard() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo]);
+  }, [goTo, newStep, play, stop, undo]);
+
+  /* Pointer ---------------------------------------------------------------- */
 
   function point(e: React.PointerEvent): { x: number; y: number } {
-    const field = fieldRef.current;
-    if (!field) return { x: 0, y: 0 };
-    const ctm = field.getScreenCTM();
+    const ctm = fieldRef.current?.getScreenCTM();
     if (!ctm) return { x: 0, y: 0 };
     const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse());
     return { x: p.x, y: p.y };
   }
 
-  function startPlayer(e: React.PointerEvent, id: string) {
-    if (tool !== "move") return;
-    e.stopPropagation();
-    const p = board.players.find((q) => q.id === id);
-    if (!p) return;
-    const at = point(e);
+  function capture(e: React.PointerEvent) {
     svgRef.current?.setPointerCapture(e.pointerId);
-    dragRef.current = { kind: "player", id, dx: at.x - p.x, dy: at.y - p.y, moved: false, startX: at.x, startY: at.y };
   }
 
-  function startBall(e: React.PointerEvent) {
-    if (tool !== "move") return;
-    e.stopPropagation();
-    const at = point(e);
-    svgRef.current?.setPointerCapture(e.pointerId);
-    dragRef.current = { kind: "ball", dx: at.x - board.ball.x, dy: at.y - board.ball.y, moved: false };
-  }
-
-  function startPitch(e: React.PointerEvent) {
-    if (tool === "run" || tool === "pass") {
+  function onPlayerDown(e: React.PointerEvent, id: string) {
+    if (playing || recording !== null) return;
+    if (tool === "mark") {
+      e.stopPropagation();
+      capture(e);
       const at = point(e);
-      svgRef.current?.setPointerCapture(e.pointerId);
+      dragRef.current = { kind: "mark", from: id };
+      setDraftMark({ from: id, x: at.x, y: at.y });
+      return;
+    }
+    if (tool !== "move") return;
+    e.stopPropagation();
+    const at = point(e);
+    const p = frame.pos[id];
+    if (!p) return;
+    capture(e);
+    dragRef.current = { kind: "player", id, dx: at.x - p[0], dy: at.y - p[1], moved: false, startX: at.x, startY: at.y };
+  }
+
+  function onBallDown(e: React.PointerEvent) {
+    if (playing || recording !== null || tool !== "move") return;
+    e.stopPropagation();
+    const at = point(e);
+    capture(e);
+    dragRef.current = { kind: "ball", dx: at.x - frame.ball[0], dy: at.y - frame.ball[1], moved: false };
+  }
+
+  function onPitchDown(e: React.PointerEvent) {
+    if (recording !== null) return;
+    if (playing) {
+      stop();
+      return;
+    }
+    const at = point(e);
+    if (tool === "run" || tool === "pass") {
+      capture(e);
       dragRef.current = { kind: "draw", draw: tool, x1: at.x, y1: at.y };
-      setDraft({ id: "draft", kind: tool, x1: at.x, y1: at.y, x2: at.x, y2: at.y });
+      setDraftLine({ id: "draft", kind: tool, step, x1: at.x, y1: at.y, x2: at.x, y2: at.y });
+    } else if (tool === "press" || tool === "space") {
+      capture(e);
+      dragRef.current = { kind: "zone", zone: tool, x1: at.x, y1: at.y };
+      setDraftZone({ id: "draft", kind: tool, x: at.x, y: at.y, w: 0, h: 0 });
     } else if (tool === "move") {
       setSelected(null);
     }
@@ -205,7 +358,19 @@ export function TacticsBoard() {
     const at = point(e);
 
     if (drag.kind === "draw") {
-      setDraft({ id: "draft", kind: drag.draw, x1: drag.x1, y1: drag.y1, x2: clampX(at.x), y2: clampY(at.y) });
+      setDraftLine({ id: "draft", kind: drag.draw, step, x1: drag.x1, y1: drag.y1, x2: clampX(at.x), y2: clampY(at.y) });
+      return;
+    }
+    if (drag.kind === "zone") {
+      const x2 = Math.max(0, Math.min(PITCH_W, at.x));
+      const y2 = Math.max(0, Math.min(PITCH_H, at.y));
+      const x1 = Math.max(0, Math.min(PITCH_W, drag.x1));
+      const y1 = Math.max(0, Math.min(PITCH_H, drag.y1));
+      setDraftZone({ id: "draft", kind: drag.zone, x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) });
+      return;
+    }
+    if (drag.kind === "mark") {
+      setDraftMark({ from: drag.from, x: at.x, y: at.y });
       return;
     }
 
@@ -214,41 +379,63 @@ export function TacticsBoard() {
       drag.moved = true;
       remember();
     }
-
-    const x = clampX(at.x - drag.dx);
-    const y = clampY(at.y - drag.dy);
+    const next: XY = [clampX(at.x - drag.dx), clampY(at.y - drag.dy)];
     if (drag.kind === "player") {
       const id = drag.id;
-      setBoard((b) => ({ ...b, players: b.players.map((p) => (p.id === id ? { ...p, x, y } : p)) }));
+      setBoard((b) => movePlayer(b, step, id, next));
     } else {
-      setBoard((b) => ({ ...b, ball: { x, y } }));
+      setBoard((b) => moveBall(b, step, next));
     }
   }
 
-  function onUp() {
+  function onUp(e: React.PointerEvent) {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag) return;
 
     if (drag.kind === "draw") {
-      const d = draft;
-      setDraft(null);
+      const d = draftLine;
+      setDraftLine(null);
       if (d && Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 2) {
-        change((b) => ({ ...b, drawings: [...b.drawings, { ...d, id: newId() }] }));
+        change((b) => ({ ...b, drawings: [...b.drawings, { ...d, id: newId("d") }] }));
       }
       return;
     }
-
+    if (drag.kind === "zone") {
+      const z = draftZone;
+      setDraftZone(null);
+      if (z && z.w > 2 && z.h > 2) change((b) => ({ ...b, zones: [...b.zones, { ...z, id: newId("z") }] }));
+      return;
+    }
+    if (drag.kind === "mark") {
+      setDraftMark(null);
+      const at = point(e);
+      const target = analysis.dots
+        .filter((d) => d.id !== drag.from)
+        .map((d) => ({ d, r: Math.hypot(d.x - at.x, d.y - at.y) }))
+        .sort((a, b) => a.r - b.r)[0];
+      if (target && target.r < 4) {
+        const exists = board.marks.some(
+          (m) => (m.from === drag.from && m.to === target.d.id) || (m.to === drag.from && m.from === target.d.id),
+        );
+        if (!exists) change((b) => ({ ...b, marks: [...b.marks, { id: newId("m"), from: drag.from, to: target.d.id }] }));
+      }
+      return;
+    }
     if (drag.kind === "player" && !drag.moved) {
       setSelected((s) => (s === drag.id ? null : drag.id));
     }
   }
 
-  function erase(e: React.PointerEvent, id: string) {
-    if (tool !== "erase") return;
+  function onErase(e: React.PointerEvent, kind: "drawing" | "zone" | "mark", id: string) {
+    if (tool !== "erase" || playing) return;
     e.stopPropagation();
-    change((b) => ({ ...b, drawings: b.drawings.filter((d) => d.id !== id) }));
+    if (kind === "drawing") change((b) => ({ ...b, drawings: b.drawings.filter((d) => d.id !== id) }));
+    if (kind === "zone") change((b) => ({ ...b, zones: b.zones.filter((z) => z.id !== id) }));
+    if (kind === "mark") change((b) => ({ ...b, marks: b.marks.filter((m) => m.id !== id) }));
   }
+
+  /* Sharing and export ----------------------------------------------------- */
 
   async function share() {
     const code = await encodeBoard(board);
@@ -256,62 +443,97 @@ export function TacticsBoard() {
     window.history.replaceState(null, "", `#b=${code}`);
     try {
       await navigator.clipboard.writeText(url);
-      say("Link copied. Anyone with it sees this board.");
+      say(steps > 1 ? `Link copied. It opens all ${steps} steps, ready to play.` : "Link copied. Anyone with it sees this board.");
     } catch {
       say("Copying was blocked. The link is in your address bar.");
     }
   }
 
+  const exportSize = () => {
+    const scale = 18;
+    const long = Math.round((PITCH_W + PAD * 2) * scale);
+    const short = Math.round((PITCH_H + PAD * 2) * scale);
+    // Even sizes keep video encoders happy.
+    const even = (n: number) => n - (n % 2);
+    return vertical ? { w: even(short), h: even(long) } : { w: even(long), h: even(short) };
+  };
+
   async function savePng() {
     const svg = svgRef.current;
     if (!svg) return;
-    const clone = svg.cloneNode(true) as SVGSVGElement;
-    const scale = 20;
-    const long = (PITCH_W + PAD * 2) * scale;
-    const short = (PITCH_H + PAD * 2) * scale;
-    const [w, h] = vertical ? [short, long] : [long, short];
-    clone.setAttribute("width", String(w));
-    clone.setAttribute("height", String(h));
-    clone.querySelectorAll("[data-ui]").forEach((n) => n.remove());
-    const xml = new XMLSerializer().serializeToString(clone);
-    const img = new Image();
-    img.decoding = "async";
-    const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml" }));
     try {
-      await new Promise<void>((resolve, reject) => {
-        img.onload = () => resolve();
-        img.onerror = () => reject(new Error("render failed"));
-        img.src = url;
-      });
+      const { w, h } = exportSize();
+      const img = await svgToImage(svg, w, h);
       const canvas = document.createElement("canvas");
       canvas.width = w;
       canvas.height = h;
       const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("no canvas");
+      if (!ctx) throw new Error();
       ctx.drawImage(img, 0, 0, w, h);
+      drawCaption(ctx, w, h, board.title, steps > 1 ? `Step ${step + 1} of ${steps}` : "tactora");
       const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png"));
-      if (!blob) throw new Error("no image");
-      const a = document.createElement("a");
-      const slug = (board.title || "tactora-board").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-      a.href = URL.createObjectURL(blob);
-      a.download = `${slug || "tactora-board"}.png`;
-      a.click();
-      window.setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      if (!blob) throw new Error();
+      download(blob, `${slug(board.title)}${steps > 1 ? `-step-${step + 1}` : ""}.png`);
       say("Image saved.");
     } catch {
       say("Couldn't make the image in this browser.");
-    } finally {
-      URL.revokeObjectURL(url);
     }
   }
+
+  async function saveVideo() {
+    if (steps < 2) {
+      say("Add a second step first. The video plays the move step by step.");
+      return;
+    }
+    if (!videoFormat()) {
+      say("This browser can't record video. Try Chrome, Edge or Safari.");
+      return;
+    }
+    stop();
+    setSelected(null);
+    setRecording(0);
+    try {
+      const { w, h } = exportSize();
+      const { blob, ext } = await recordVideo({
+        svg: () => svgRef.current,
+        width: w,
+        height: h,
+        steps,
+        speed,
+        title: board.title,
+        show: (t) => flushSync(() => setPlayT(t)),
+        onProgress: (f) => setRecording(f),
+      });
+      download(blob, `${slug(board.title)}.${ext}`);
+      say(`Video saved (${ext.toUpperCase()}).`);
+    } catch (err) {
+      say(err instanceof Error && err.message ? err.message : "Couldn't record the video.");
+    } finally {
+      setRecording(null);
+      setPlayT(null);
+      setStep(steps - 1);
+    }
+  }
+
+  /* Panel helpers ---------------------------------------------------------- */
 
   function setTeam(team: Team, patch: Partial<Board["home"]> & { shown?: boolean }) {
     change((b) => ({ ...b, [team]: { ...b[team], ...patch } }));
   }
 
+  function pickFormation(e: React.MouseEvent<HTMLButtonElement>) {
+    const { team, formation } = e.currentTarget.dataset;
+    if ((team !== "home" && team !== "away") || !formation) return;
+    change((b) => applyFormation(b, team, formation, step));
+  }
+
+  function toggleOverlay(key: keyof Overlays) {
+    setBoard((b) => ({ ...b, overlays: { ...b.overlays, [key]: !b.overlays[key] } }));
+  }
+
   const selectedPlayer = board.players.find((p) => p.id === selected) ?? null;
-  const visiblePlayers = board.players.filter((p) => p.team === "home" || board.away.shown);
-  const lines = draft ? [...board.drawings, draft] : board.drawings;
+  const hint = TOOLS.find(([id]) => id === tool)?.[3] ?? "";
+  const busy = recording !== null;
 
   return (
     <div className="board-layout">
@@ -320,180 +542,126 @@ export function TacticsBoard() {
           <input
             className="board-title"
             value={board.title}
-            placeholder="Name this tactic"
+            placeholder="Name this move"
             maxLength={60}
-            aria-label="Tactic name"
+            aria-label="Move name"
             onFocus={remember}
             onChange={(e) => setBoard((b) => ({ ...b, title: e.target.value }))}
           />
-          <div className="tools" role="toolbar" aria-label="Tools">
-            {(
-              [
-                ["move", "Move", "V"],
-                ["run", "Run", "R"],
-                ["pass", "Pass", "P"],
-                ["erase", "Erase", "E"],
-              ] as [Tool, string, string][]
-            ).map(([id, label, key]) => (
-              <button
-                key={id}
-                type="button"
-                className={`tool tool-${id}`}
-                aria-pressed={tool === id}
-                title={`${label} (${key})`}
-                onClick={() => setTool(id)}
-              >
-                <span className="tool-glyph" aria-hidden="true" />
-                {label}
-              </button>
-            ))}
+        </div>
+
+        <div className="tools" role="toolbar" aria-label="Tools">
+          {TOOLS.map(([id, label, key]) => (
+            <button
+              key={id}
+              type="button"
+              className={`tool tool-${id}`}
+              aria-pressed={tool === id}
+              title={`${label} (${key})`}
+              onClick={() => setTool(id)}
+              disabled={busy}
+            >
+              <span className="tool-glyph" aria-hidden="true" />
+              <span className="tool-label">{label}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className={`pitch-wrap tool-is-${tool}${playing ? " is-playing" : ""}`}>
+          <Pitch
+            board={board}
+            frame={frame}
+            prevFrame={prevFrame}
+            step={shownStep}
+            playing={playing}
+            vertical={vertical}
+            tool={tool}
+            selected={selected}
+            draftLine={draftLine}
+            draftZone={draftZone}
+            draftMark={draftMark}
+            analysis={analysis}
+            svgRef={svgRef}
+            fieldRef={fieldRef}
+            onPitchDown={onPitchDown}
+            onPlayerDown={onPlayerDown}
+            onBallDown={onBallDown}
+            onErase={onErase}
+            onMove={onMove}
+            onUp={onUp}
+          />
+          {busy && (
+            <div className="rec-badge" role="status">
+              <span className="rec-dot" aria-hidden="true" />
+              Recording {Math.round((recording ?? 0) * 100)}%
+            </div>
+          )}
+        </div>
+
+        {/* Timeline */}
+        <div className="timeline" aria-label="Steps">
+          <button
+            type="button"
+            className={`play${playing ? " is-on" : ""}`}
+            onClick={() => (playing ? stop() : play())}
+            disabled={busy}
+            aria-label={playing ? "Pause" : "Play the move"}
+            title="Play / pause (Space)"
+          >
+            <span className={playing ? "glyph-pause" : "glyph-play"} aria-hidden="true" />
+          </button>
+
+          <div className="steps" role="tablist" aria-label="Steps">
+            {board.frames.map((_, i) => {
+              const live = playing ? shownStep === i : step === i;
+              return (
+                <button key={i} type="button" role="tab" className="step" aria-selected={live} onClick={() => goTo(i)} disabled={busy}>
+                  {i + 1}
+                  {playing && shownStep === i && playT !== null && i < steps - 1 && (
+                    <span className="step-progress" style={{ width: `${(playT - i) * 100}%` }} aria-hidden="true" />
+                  )}
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              className="step step-add"
+              onClick={newStep}
+              disabled={busy || steps >= MAX_STEPS}
+              title="Add a step after this one (N)"
+            >
+              + Step
+            </button>
+          </div>
+
+          <div className="timeline-opts">
+            <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} aria-label="Playback speed" disabled={busy}>
+              <option value={0.5}>0.5×</option>
+              <option value={1}>1×</option>
+              <option value={1.5}>1.5×</option>
+              <option value={2}>2×</option>
+            </select>
+            <label className="switch" title="Loop playback">
+              <input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} disabled={busy} />
+              <span>Loop</span>
+            </label>
+            <button type="button" className="link-btn" onClick={deleteStep} disabled={busy || steps <= 1}>
+              Delete step
+            </button>
           </div>
         </div>
 
-        <div className={`pitch-wrap tool-is-${tool}`}>
-          <svg
-            ref={svgRef}
-            className="pitch"
-            viewBox={
-              vertical
-                ? `${-PAD} ${-PAD} ${PITCH_H + PAD * 2} ${PITCH_W + PAD * 2}`
-                : `${-PAD} ${-PAD} ${PITCH_W + PAD * 2} ${PITCH_H + PAD * 2}`
-            }
-            xmlns="http://www.w3.org/2000/svg"
-            role="img"
-            aria-label={`${board.home.name} ${board.home.formation}${board.away.shown ? ` against ${board.away.name} ${board.away.formation}` : ""}`}
-            onPointerDown={startPitch}
-            onPointerMove={onMove}
-            onPointerUp={onUp}
-            onPointerCancel={onUp}
-          >
-            <defs>
-              <marker id="head-run" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                <path d="M0 0 L10 5 L0 10 z" fill="#ffffff" />
-              </marker>
-              <marker id="head-pass" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                <path d="M0 0 L10 5 L0 10 z" fill="#c8f53c" />
-              </marker>
-            </defs>
-
-            <g ref={fieldRef} transform={vertical ? `translate(${PITCH_H} 0) rotate(90)` : undefined}>
-            {/* Turf */}
-            <rect x={-PAD} y={-PAD} width={PITCH_W + PAD * 2} height={PITCH_H + PAD * 2} fill="#1d7a4c" />
-            {Array.from({ length: 12 }, (_, i) => (
-              <rect key={i} x={(PITCH_W / 12) * i} y={0} width={PITCH_W / 12} height={PITCH_H} fill={i % 2 ? "#228a56" : "#1f8050"} />
-            ))}
-
-            {/* Markings */}
-            <g fill="none" stroke="rgba(255,255,255,0.85)" strokeWidth={0.3}>
-              <rect x={0} y={0} width={PITCH_W} height={PITCH_H} />
-              <line x1={PITCH_W / 2} y1={0} x2={PITCH_W / 2} y2={PITCH_H} />
-              <circle cx={PITCH_W / 2} cy={PITCH_H / 2} r={9.15} />
-              {[0, 1].map((side) => {
-                const x0 = side ? PITCH_W : 0;
-                const dir = side ? -1 : 1;
-                const box = (depth: number, width: number) => (
-                  <rect x={side ? PITCH_W - depth : 0} y={(PITCH_H - width) / 2} width={depth} height={width} />
-                );
-                const arcX = x0 + dir * 16.5;
-                const dy = Math.sqrt(9.15 ** 2 - 5.5 ** 2);
-                return (
-                  <g key={side}>
-                    {box(16.5, 40.32)}
-                    {box(5.5, 18.32)}
-                    <path d={`M ${arcX} ${PITCH_H / 2 - dy} A 9.15 9.15 0 0 ${side ? 0 : 1} ${arcX} ${PITCH_H / 2 + dy}`} />
-                    <rect x={side ? PITCH_W : -1.6} y={(PITCH_H - 7.32) / 2} width={1.6} height={7.32} />
-                  </g>
-                );
-              })}
-            </g>
-            <g fill="rgba(255,255,255,0.85)">
-              <circle cx={PITCH_W / 2} cy={PITCH_H / 2} r={0.35} />
-              <circle cx={11} cy={PITCH_H / 2} r={0.3} />
-              <circle cx={PITCH_W - 11} cy={PITCH_H / 2} r={0.3} />
-            </g>
-
-            {/* Runs and passes */}
-            <g>
-              {lines.map((d) => (
-                <g key={d.id} className="drawing" onPointerDown={(e) => erase(e, d.id)}>
-                  <line x1={d.x1} y1={d.y1} x2={d.x2} y2={d.y2} stroke="transparent" strokeWidth={2.4} />
-                  <line
-                    x1={d.x1}
-                    y1={d.y1}
-                    x2={d.x2}
-                    y2={d.y2}
-                    stroke={d.kind === "run" ? "#ffffff" : "#c8f53c"}
-                    strokeWidth={0.45}
-                    strokeLinecap="round"
-                    strokeDasharray={d.kind === "pass" ? "1.2 0.9" : undefined}
-                    markerEnd={`url(#head-${d.kind})`}
-                  />
-                </g>
-              ))}
-            </g>
-
-            {/* Players */}
-            {visiblePlayers.map((p) => {
-              const fill = board[p.team].color;
-              const isSel = p.id === selected;
-              return (
-                <g
-                  key={p.id}
-                  className="player"
-                  transform={`translate(${p.x} ${p.y})${vertical ? " rotate(-90)" : ""}`}
-                  onPointerDown={(e) => startPlayer(e, p.id)}
-                >
-                  {isSel && <circle data-ui r={3.1} fill="none" stroke="#c8f53c" strokeWidth={0.45} />}
-                  <circle r={2.1} fill={fill} stroke="rgba(255,255,255,0.9)" strokeWidth={0.3} />
-                  <text
-                    y={0.75}
-                    textAnchor="middle"
-                    fontSize={2.1}
-                    fontWeight={800}
-                    fontFamily="Arial, Helvetica, sans-serif"
-                    fill={textOn(fill)}
-                  >
-                    {p.num}
-                  </text>
-                  {p.name && (
-                    <text
-                      y={4.3}
-                      textAnchor="middle"
-                      fontSize={1.6}
-                      fontWeight={700}
-                      fontFamily="Arial, Helvetica, sans-serif"
-                      fill="#ffffff"
-                      stroke="rgba(10,40,24,0.75)"
-                      strokeWidth={0.35}
-                      paintOrder="stroke"
-                    >
-                      {p.name}
-                    </text>
-                  )}
-                </g>
-              );
-            })}
-
-            {/* Ball */}
-            <g className="ball" transform={`translate(${board.ball.x} ${board.ball.y})`} onPointerDown={startBall}>
-              <circle r={1.6} fill="transparent" />
-              <circle r={0.9} fill="#ffffff" stroke="#16201b" strokeWidth={0.22} />
-              <path d="M0 -0.42 L0.4 -0.13 L0.25 0.34 L-0.25 0.34 L-0.4 -0.13 Z" fill="#16201b" />
-            </g>
-            </g>
-          </svg>
-        </div>
-
         <p className="board-hint">
-          {tool === "move" && "Drag players and the ball. Tap a player to rename them."}
-          {tool === "run" && "Drag on the pitch to draw a run."}
-          {tool === "pass" && "Drag on the pitch to draw a pass."}
-          {tool === "erase" && "Tap a run or pass to remove it."}
+          {playing
+            ? "Playing. Tap the pitch or press Space to stop."
+            : steps > 1 && step > 0 && tool === "move"
+              ? `Step ${step + 1}: drag players to where they go next. Faded rings show where they came from.`
+              : hint}
         </p>
       </section>
 
       <aside className="panel" aria-label="Board settings">
-        {selectedPlayer ? (
+        {selectedPlayer && (
           <div className="card card-player">
             <div className="card-head">
               <h2>Player</h2>
@@ -534,90 +702,115 @@ export function TacticsBoard() {
               </label>
             </div>
           </div>
-        ) : null}
+        )}
 
-        {(["home", "away"] as Team[]).map((team) => {
-          const t = board[team];
-          const shown = team === "home" || board.away.shown;
-          return (
-            <div key={team} className={`card${shown ? "" : " is-off"}`}>
-              <div className="card-head">
-                <span className="team-dot" style={{ background: t.color }} aria-hidden="true" />
-                <input
-                  className="team-name"
-                  value={t.name}
-                  maxLength={24}
-                  aria-label={`${team === "home" ? "Home" : "Away"} team name`}
-                  onFocus={remember}
-                  onChange={(e) => setBoard((b) => ({ ...b, [team]: { ...b[team], name: e.target.value } }))}
-                />
-                {team === "away" && (
-                  <label className="switch">
-                    <input
-                      type="checkbox"
-                      checked={board.away.shown}
-                      onChange={(e) => setTeam("away", { shown: e.target.checked })}
-                    />
-                    <span>Show</span>
-                  </label>
-                )}
-              </div>
-              <div className="formations" role="group" aria-label={`${t.name} formation`}>
-                {FORMATION_NAMES.map((f) => (
-                  <button
-                    key={f}
-                    type="button"
-                    className="chip"
-                    aria-pressed={t.formation === f}
-                    disabled={!shown}
-                    onClick={() => change((b) => applyFormation(b, team, f))}
-                  >
-                    {f}
-                  </button>
-                ))}
-              </div>
-              <div className="swatches" role="group" aria-label={`${t.name} shirt colour`}>
-                {TEAM_COLORS.map((c) => (
-                  <button
-                    key={c}
-                    type="button"
-                    className="swatch"
-                    style={{ background: c }}
-                    aria-label={`Colour ${c}`}
-                    aria-pressed={t.color === c}
-                    disabled={!shown}
-                    onClick={() => setTeam(team, { color: c })}
+        <div className="panel-tabs" role="tablist" aria-label="Panel">
+          <button type="button" role="tab" aria-selected={tab === "teams"} onClick={() => setTab("teams")}>
+            Teams
+          </button>
+          <button type="button" role="tab" aria-selected={tab === "analysis"} onClick={() => setTab("analysis")}>
+            Analysis
+            {Object.values(board.overlays).some(Boolean) && <span className="tab-dot" aria-hidden="true" />}
+          </button>
+        </div>
+
+        {tab === "teams" &&
+          (["home", "away"] as Team[]).map((team) => {
+            const t = board[team];
+            const shown = team === "home" || board.away.shown;
+            return (
+              <div key={team} className={`card${shown ? "" : " is-off"}`}>
+                <div className="card-head">
+                  <span className="team-dot" style={{ background: t.color }} aria-hidden="true" />
+                  <input
+                    className="team-name"
+                    value={t.name}
+                    maxLength={24}
+                    aria-label={`${team === "home" ? "Home" : "Away"} team name`}
+                    onFocus={remember}
+                    onChange={(e) => setBoard((b) => ({ ...b, [team]: { ...b[team], name: e.target.value } }))}
                   />
-                ))}
+                  {team === "away" && (
+                    <label className="switch">
+                      <input type="checkbox" checked={board.away.shown} onChange={(e) => setTeam("away", { shown: e.target.checked })} />
+                      <span>Show</span>
+                    </label>
+                  )}
+                </div>
+                <div className="formations" role="group" aria-label={`${t.name} formation`}>
+                  {FORMATION_NAMES.map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      className="chip"
+                      aria-pressed={t.formation === f}
+                      disabled={!shown || busy}
+                      data-team={team}
+                      data-formation={f}
+                      onClick={pickFormation}
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+                <div className="swatches" role="group" aria-label={`${t.name} shirt colour`}>
+                  {TEAM_COLORS.map((c) => (
+                    <button
+                      key={c}
+                      type="button"
+                      className="swatch"
+                      style={{ background: c }}
+                      aria-label={`Colour ${c}`}
+                      aria-pressed={t.color === c}
+                      disabled={!shown}
+                      onClick={() => setTeam(team, { color: c })}
+                    />
+                  ))}
+                </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })}
+
+        {tab === "analysis" && <AnalysisPanel board={board} analysis={analysis} onToggle={toggleOverlay} />}
 
         <div className="card card-actions">
-          <button type="button" className="btn btn-ink" onClick={share}>
+          <button type="button" className="btn btn-ink" onClick={share} disabled={busy}>
             Copy share link
           </button>
-          <button type="button" className="btn btn-line" onClick={savePng}>
-            Save as image
-          </button>
+          <div className="actions-pair">
+            <button type="button" className="btn btn-line" onClick={savePng} disabled={busy}>
+              Save image
+            </button>
+            <button
+              type="button"
+              className="btn btn-line"
+              onClick={saveVideo}
+              disabled={busy || steps < 2}
+              title={steps < 2 ? "Add a second step to make a video" : "Record the move as a video"}
+            >
+              {busy ? `${Math.round((recording ?? 0) * 100)}%` : "Save video"}
+            </button>
+          </div>
           <div className="actions-row">
-            <button type="button" className="btn btn-quiet" onClick={undo} disabled={!canUndo}>
+            <button type="button" className="btn btn-quiet" onClick={undo} disabled={!canUndo || busy}>
               Undo
             </button>
             <button
               type="button"
               className="btn btn-quiet"
-              disabled={board.drawings.length === 0}
-              onClick={() => change((b) => ({ ...b, drawings: [] }))}
+              disabled={busy || (board.drawings.length === 0 && board.zones.length === 0 && board.marks.length === 0)}
+              onClick={() => change((b) => ({ ...b, drawings: [], zones: [], marks: [] }))}
             >
-              Clear lines
+              Clear marks
             </button>
             <button
               type="button"
               className="btn btn-quiet"
+              disabled={busy}
               onClick={() => {
+                stop();
                 change(defaultBoard());
+                setStep(0);
                 setSelected(null);
                 window.history.replaceState(null, "", window.location.pathname);
               }}

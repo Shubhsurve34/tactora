@@ -27,7 +27,7 @@ export default function Home() {
       </main>
 
       <footer className="foot wrap">
-        <p>Boards save on your device. Share links carry the whole board, so nothing is stored on a server.</p>
+        <p>Boards save on your device. Share links carry every step, so nothing is stored on a server.</p>
         <p>
           Also from ShubhTechIN:{" "}
           <a href="https://dropzuu.vercel.app" target="_blank" rel="noopener noreferrer">

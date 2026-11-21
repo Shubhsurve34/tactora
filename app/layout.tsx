@@ -8,13 +8,13 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Tactora | Football tactics board",
   description:
-    "Set formations, move players and draw runs and passes on a football pitch, then share the tactic as a link. A ShubhTechIN project.",
+    "Build football moves step by step and play them back. Live space control, offside lines, team shape in metres, cover shadows and passing lanes. A ShubhTechIN project.",
   applicationName: "Tactora",
   openGraph: {
     type: "website",
     siteName: "Tactora",
     title: "Tactora | Football tactics board",
-    description: "Set formations, move players, draw runs and passes, and share the tactic as a link.",
+    description: "Animated moves, live space control, offside lines and team shape in metres.",
     locale: "en_IN",
   },
 };

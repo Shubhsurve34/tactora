@@ -12,11 +12,13 @@
   "dependencies": {
     "@fontsource-variable/anybody": "^5",
     "@fontsource/hanken-grotesk": "^5",
+    "d3-delaunay": "^6.0.6",
     "next": "^16.4.6",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
   "devDependencies": {
+    "@types/d3-delaunay": "^6.0.4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
