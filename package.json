@@ -13,6 +13,7 @@
     "@fontsource-variable/anybody": "^5",
     "@fontsource/hanken-grotesk": "^5",
     "d3-delaunay": "^6.0.6",
+    "mp4-muxer": "^5.2.2",
     "next": "^16.4.6",
     "react": "19.3.0",
     "react-dom": "19.3.0"

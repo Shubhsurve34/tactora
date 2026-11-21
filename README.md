@@ -10,7 +10,7 @@ A [ShubhTechIN](https://shubham-portfolio-mu-puce.vercel.app) project, built wit
 - Up to 12 steps per move. Add a step, drag players to where they go next, and Tactora animates between steps with easing.
 - Faded rings and dotted arrows show where each player came from in the previous step.
 - Play, pause, loop, 0.5× to 2× speed.
-- Save the move as an MP4 video (WebM where MP4 isn't supported), recorded in the browser.
+- Save the move as a smooth 30 fps MP4, encoded in the browser with WebCodecs (real-time recording as a fallback).
 
 **Space control**
 - A live Voronoi map of who reaches each patch of grass first, with each team's share of the pitch and of the third it attacks.

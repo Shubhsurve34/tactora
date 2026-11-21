@@ -29,8 +29,27 @@ import {
   movePlayer,
   removeStep,
 } from "@/lib/board";
-import { download, drawCaption, recordVideo, slug, svgToImage, timelineAt, timelineLength, videoFormat } from "@/lib/export";
+import { canRecordVideo, download, drawCaption, recordVideo, slug, svgToImage, timelineAt, timelineLength } from "@/lib/export";
 import { PAD, Pitch } from "./Pitch";
+import { FormationGlyph } from "./FormationGlyph";
+import { Timeline } from "./Timeline";
+import {
+  AnalysisIcon,
+  CloseIcon,
+  EraseIcon,
+  ImageIcon,
+  LinkIcon,
+  MarkIcon,
+  MoveIcon,
+  NewBoardIcon,
+  PassIcon,
+  PressIcon,
+  RunIcon,
+  SpaceIcon,
+  TeamsIcon,
+  UndoIcon,
+  VideoIcon,
+} from "./Icons";
 import { AnalysisPanel } from "./AnalysisPanel";
 import { useAnalysis } from "./useAnalysis";
 
@@ -44,14 +63,16 @@ type Drag =
   | { kind: "zone"; zone: ZoneKind; x1: number; y1: number }
   | { kind: "mark"; from: string };
 
-const TOOLS: [Tool, string, string, string][] = [
-  ["move", "Move", "V", "Drag players and the ball. Tap a player to rename them."],
-  ["run", "Run", "R", "Drag on the pitch to draw a run for this step."],
-  ["pass", "Pass", "P", "Drag on the pitch to draw a pass for this step."],
-  ["press", "Press", "Z", "Drag a box where your team should press."],
-  ["space", "Space", "S", "Drag a box over space to attack."],
-  ["mark", "Mark", "M", "Drag from a player to the opponent they mark."],
-  ["erase", "Erase", "E", "Tap a line, zone or marking link to remove it."],
+type IconCmp = (p: { size?: number }) => React.ReactElement;
+
+const TOOLS: [Tool, string, string, string, IconCmp][] = [
+  ["move", "Move", "V", "Drag players and the ball. Tap a player to name them.", MoveIcon],
+  ["run", "Run", "R", "Drag on the pitch to draw a run for this step.", RunIcon],
+  ["pass", "Pass", "P", "Drag on the pitch to draw a pass for this step.", PassIcon],
+  ["press", "Press zone", "Z", "Drag a box where your team should press.", PressIcon],
+  ["space", "Space", "S", "Drag a box over space to attack.", SpaceIcon],
+  ["mark", "Mark", "M", "Drag from a player to the opponent they mark.", MarkIcon],
+  ["erase", "Erase", "E", "Tap a run, pass, zone or marking link to remove it.", EraseIcon],
 ];
 
 let idCounter = 0;
@@ -470,7 +491,7 @@ export function TacticsBoard() {
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error();
       ctx.drawImage(img, 0, 0, w, h);
-      drawCaption(ctx, w, h, board.title, steps > 1 ? `Step ${step + 1} of ${steps}` : "tactora");
+      drawCaption(ctx, w, h, board.title, steps > 1 ? `Step ${step + 1} of ${steps}` : "");
       const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png"));
       if (!blob) throw new Error();
       download(blob, `${slug(board.title)}${steps > 1 ? `-step-${step + 1}` : ""}.png`);
@@ -485,7 +506,7 @@ export function TacticsBoard() {
       say("Add a second step first. The video plays the move step by step.");
       return;
     }
-    if (!videoFormat()) {
+    if (!canRecordVideo()) {
       say("This browser can't record video. Try Chrome, Edge or Safari.");
       return;
     }
@@ -531,296 +552,295 @@ export function TacticsBoard() {
     setBoard((b) => ({ ...b, overlays: { ...b.overlays, [key]: !b.overlays[key] } }));
   }
 
+  function newBoard() {
+    stop();
+    change(defaultBoard());
+    setStep(0);
+    setSelected(null);
+    window.history.replaceState(null, "", window.location.pathname);
+  }
+
   const selectedPlayer = board.players.find((p) => p.id === selected) ?? null;
   const hint = TOOLS.find(([id]) => id === tool)?.[3] ?? "";
   const busy = recording !== null;
+  const hasMarks = board.drawings.length > 0 || board.zones.length > 0 || board.marks.length > 0;
 
   return (
-    <div className="board-layout">
-      <section className="board-main" aria-label="Tactics board">
-        <div className="board-head">
-          <input
-            className="board-title"
-            value={board.title}
-            placeholder="Name this move"
-            maxLength={60}
-            aria-label="Move name"
-            onFocus={remember}
-            onChange={(e) => setBoard((b) => ({ ...b, title: e.target.value }))}
-          />
-        </div>
-
-        <div className="tools" role="toolbar" aria-label="Tools">
-          {TOOLS.map(([id, label, key]) => (
-            <button
-              key={id}
-              type="button"
-              className={`tool tool-${id}`}
-              aria-pressed={tool === id}
-              title={`${label} (${key})`}
-              onClick={() => setTool(id)}
-              disabled={busy}
-            >
-              <span className="tool-glyph" aria-hidden="true" />
-              <span className="tool-label">{label}</span>
-            </button>
-          ))}
-        </div>
-
-        <div className={`pitch-wrap tool-is-${tool}${playing ? " is-playing" : ""}`}>
-          <Pitch
-            board={board}
-            frame={frame}
-            prevFrame={prevFrame}
-            step={shownStep}
-            playing={playing}
-            vertical={vertical}
-            tool={tool}
-            selected={selected}
-            draftLine={draftLine}
-            draftZone={draftZone}
-            draftMark={draftMark}
-            analysis={analysis}
-            svgRef={svgRef}
-            fieldRef={fieldRef}
-            onPitchDown={onPitchDown}
-            onPlayerDown={onPlayerDown}
-            onBallDown={onBallDown}
-            onErase={onErase}
-            onMove={onMove}
-            onUp={onUp}
-          />
-          {busy && (
-            <div className="rec-badge" role="status">
-              <span className="rec-dot" aria-hidden="true" />
-              Recording {Math.round((recording ?? 0) * 100)}%
-            </div>
-          )}
-        </div>
-
-        {/* Timeline */}
-        <div className="timeline" aria-label="Steps">
+    <div className="studio">
+      <div className="studio-head">
+        <input
+          className="board-title"
+          value={board.title}
+          placeholder="Name this move"
+          maxLength={60}
+          aria-label="Move name"
+          onFocus={remember}
+          onChange={(e) => setBoard((b) => ({ ...b, title: e.target.value }))}
+        />
+        <div className="head-actions">
+          <button type="button" className="btn btn-quiet btn-icon-text" onClick={newBoard} disabled={busy} title="Start a new board">
+            <NewBoardIcon size={18} />
+            <span>New</span>
+          </button>
+          <button type="button" className="btn btn-line btn-icon-text" onClick={savePng} disabled={busy}>
+            <ImageIcon size={18} />
+            <span>Image</span>
+          </button>
           <button
             type="button"
-            className={`play${playing ? " is-on" : ""}`}
-            onClick={() => (playing ? stop() : play())}
-            disabled={busy}
-            aria-label={playing ? "Pause" : "Play the move"}
-            title="Play / pause (Space)"
+            className="btn btn-line btn-icon-text"
+            onClick={saveVideo}
+            disabled={busy || steps < 2}
+            title={steps < 2 ? "Add a second step to make a video" : "Record the move as a video"}
           >
-            <span className={playing ? "glyph-pause" : "glyph-play"} aria-hidden="true" />
+            <VideoIcon size={18} />
+            <span>{busy ? `Recording ${Math.round((recording ?? 0) * 100)}%` : "Video"}</span>
           </button>
+          <button type="button" className="btn btn-ink btn-icon-text" onClick={share} disabled={busy}>
+            <LinkIcon size={18} />
+            <span>Copy link</span>
+          </button>
+        </div>
+      </div>
 
-          <div className="steps" role="tablist" aria-label="Steps">
-            {board.frames.map((_, i) => {
-              const live = playing ? shownStep === i : step === i;
-              return (
-                <button key={i} type="button" role="tab" className="step" aria-selected={live} onClick={() => goTo(i)} disabled={busy}>
-                  {i + 1}
-                  {playing && shownStep === i && playT !== null && i < steps - 1 && (
-                    <span className="step-progress" style={{ width: `${(playT - i) * 100}%` }} aria-hidden="true" />
-                  )}
+      <div className="board-layout">
+        <section className="stage" aria-label="Tactics board">
+          <nav className="rail" role="toolbar" aria-label="Tools" aria-orientation="vertical">
+            {TOOLS.map(([id, label, key, , Glyph]) => (
+              <button
+                key={id}
+                type="button"
+                className="rail-btn"
+                aria-pressed={tool === id}
+                aria-label={`${label} (${key})`}
+                onClick={() => setTool(id)}
+                disabled={busy}
+              >
+                <Glyph size={21} />
+                <span className="tip" role="tooltip">
+                  {label}
+                  <kbd>{key}</kbd>
+                </span>
+              </button>
+            ))}
+            <span className="rail-sep" aria-hidden="true" />
+            <button type="button" className="rail-btn" onClick={undo} disabled={!canUndo || busy} aria-label="Undo (Ctrl+Z)">
+              <UndoIcon size={21} />
+              <span className="tip" role="tooltip">
+                Undo
+                <kbd>Ctrl Z</kbd>
+              </span>
+            </button>
+            <button
+              type="button"
+              className="rail-btn"
+              onClick={() => change((b) => ({ ...b, drawings: [], zones: [], marks: [] }))}
+              disabled={!hasMarks || busy}
+              aria-label="Clear runs, passes, zones and marking"
+            >
+              <CloseIcon size={21} />
+              <span className="tip" role="tooltip">
+                Clear drawings
+              </span>
+            </button>
+          </nav>
+
+          <div className="stage-main">
+            <div className={`pitch-wrap tool-is-${tool}${playing ? " is-playing" : ""}`}>
+              <Pitch
+                board={board}
+                frame={frame}
+                prevFrame={prevFrame}
+                step={shownStep}
+                playing={playing}
+                vertical={vertical}
+                selected={selected}
+                draftLine={draftLine}
+                draftZone={draftZone}
+                draftMark={draftMark}
+                analysis={analysis}
+                svgRef={svgRef}
+                fieldRef={fieldRef}
+                onPitchDown={onPitchDown}
+                onPlayerDown={onPlayerDown}
+                onBallDown={onBallDown}
+                onErase={onErase}
+                onMove={onMove}
+                onUp={onUp}
+              />
+              <div className="scoreline" aria-hidden="true">
+                <span className="score-team">
+                  <i style={{ background: board.home.color }} />
+                  {board.home.name}
+                  <b>{board.home.formation}</b>
+                </span>
+                {board.away.shown && (
+                  <span className="score-team">
+                    <i style={{ background: board.away.color }} />
+                    {board.away.name}
+                    <b>{board.away.formation}</b>
+                  </span>
+                )}
+                <span className="score-step">
+                  {shownStep + 1}/{steps}
+                </span>
+              </div>
+              {busy && (
+                <div className="rec-badge" role="status">
+                  <span className="rec-dot" aria-hidden="true" />
+                  Recording {Math.round((recording ?? 0) * 100)}%
+                </div>
+              )}
+            </div>
+
+            <Timeline
+              steps={steps}
+              step={step}
+              playT={playT}
+              busy={busy}
+              speed={speed}
+              loop={loop}
+              onPlay={play}
+              onStop={stop}
+              onGo={goTo}
+              onAdd={newStep}
+              onDelete={deleteStep}
+              onSpeed={setSpeed}
+              onLoop={setLoop}
+            />
+
+            <p className="board-hint">
+              {playing
+                ? "Playing. Tap the pitch or press Space to stop."
+                : steps > 1 && step > 0 && tool === "move"
+                  ? `Step ${step + 1}: drag players to where they go next. The trails show where they came from.`
+                  : hint}
+            </p>
+          </div>
+        </section>
+
+        <aside className="panel" aria-label="Board settings">
+          {selectedPlayer && (
+            <div className="card card-player">
+              <div className="card-head">
+                <span className="kit-dot" style={{ background: board[selectedPlayer.team].color }} aria-hidden="true" />
+                <h2>{board[selectedPlayer.team].name} player</h2>
+                <button type="button" className="icon-btn" onClick={() => setSelected(null)} aria-label="Close">
+                  <CloseIcon size={18} />
                 </button>
+              </div>
+              <div className="field-row">
+                <label className="field field-num">
+                  <span>Number</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={99}
+                    value={selectedPlayer.num}
+                    onFocus={remember}
+                    onChange={(e) => {
+                      const num = Math.max(0, Math.min(99, Number(e.target.value) || 0));
+                      setBoard((b) => ({ ...b, players: b.players.map((p) => (p.id === selectedPlayer.id ? { ...p, num } : p)) }));
+                    }}
+                  />
+                </label>
+                <label className="field">
+                  <span>Name</span>
+                  <input
+                    value={selectedPlayer.name}
+                    maxLength={24}
+                    placeholder="Optional"
+                    autoFocus
+                    onFocus={remember}
+                    onChange={(e) =>
+                      setBoard((b) => ({
+                        ...b,
+                        players: b.players.map((p) => (p.id === selectedPlayer.id ? { ...p, name: e.target.value } : p)),
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+            </div>
+          )}
+
+          <div className="panel-tabs" role="tablist" aria-label="Panel">
+            <button type="button" role="tab" aria-selected={tab === "teams"} onClick={() => setTab("teams")}>
+              <TeamsIcon size={18} />
+              Teams
+            </button>
+            <button type="button" role="tab" aria-selected={tab === "analysis"} onClick={() => setTab("analysis")}>
+              <AnalysisIcon size={18} />
+              Analysis
+              {Object.values(board.overlays).some(Boolean) && <span className="tab-dot" aria-label="Overlays on" />}
+            </button>
+          </div>
+
+          {tab === "teams" &&
+            (["home", "away"] as Team[]).map((team) => {
+              const t = board[team];
+              const shown = team === "home" || board.away.shown;
+              return (
+                <div key={team} className={`card card-team${shown ? "" : " is-off"}`}>
+                  <div className="card-head">
+                    <span className="kit-dot" style={{ background: t.color }} aria-hidden="true" />
+                    <input
+                      className="team-name"
+                      value={t.name}
+                      maxLength={24}
+                      aria-label={`${team === "home" ? "Home" : "Away"} team name`}
+                      onFocus={remember}
+                      onChange={(e) => setBoard((b) => ({ ...b, [team]: { ...b[team], name: e.target.value } }))}
+                    />
+                    {team === "away" && (
+                      <label className="switch" title={board.away.shown ? "Hide the away team" : "Show the away team"}>
+                        <input type="checkbox" checked={board.away.shown} onChange={(e) => setTeam("away", { shown: e.target.checked })} />
+                        <span className="switch-track" aria-hidden="true" />
+                        <span className="sr-only">Show away team</span>
+                      </label>
+                    )}
+                  </div>
+                  <div className="formations" role="group" aria-label={`${t.name} formation`}>
+                    {FORMATION_NAMES.map((f) => (
+                      <button
+                        key={f}
+                        type="button"
+                        className="formation"
+                        aria-pressed={t.formation === f}
+                        disabled={!shown || busy}
+                        data-team={team}
+                        data-formation={f}
+                        onClick={pickFormation}
+                      >
+                        <FormationGlyph formation={f} color={t.color} />
+                        <span>{f}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="swatches" role="radiogroup" aria-label={`${t.name} kit colour`}>
+                    {TEAM_COLORS.map((c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        role="radio"
+                        className="swatch"
+                        style={{ background: c }}
+                        aria-label={`Kit colour ${c}`}
+                        aria-checked={t.color === c}
+                        disabled={!shown}
+                        onClick={() => setTeam(team, { color: c })}
+                      />
+                    ))}
+                  </div>
+                </div>
               );
             })}
-            <button
-              type="button"
-              className="step step-add"
-              onClick={newStep}
-              disabled={busy || steps >= MAX_STEPS}
-              title="Add a step after this one (N)"
-            >
-              + Step
-            </button>
-          </div>
 
-          <div className="timeline-opts">
-            <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} aria-label="Playback speed" disabled={busy}>
-              <option value={0.5}>0.5×</option>
-              <option value={1}>1×</option>
-              <option value={1.5}>1.5×</option>
-              <option value={2}>2×</option>
-            </select>
-            <label className="switch" title="Loop playback">
-              <input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} disabled={busy} />
-              <span>Loop</span>
-            </label>
-            <button type="button" className="link-btn" onClick={deleteStep} disabled={busy || steps <= 1}>
-              Delete step
-            </button>
-          </div>
-        </div>
+          {tab === "analysis" && <AnalysisPanel board={board} analysis={analysis} onToggle={toggleOverlay} />}
 
-        <p className="board-hint">
-          {playing
-            ? "Playing. Tap the pitch or press Space to stop."
-            : steps > 1 && step > 0 && tool === "move"
-              ? `Step ${step + 1}: drag players to where they go next. Faded rings show where they came from.`
-              : hint}
-        </p>
-      </section>
-
-      <aside className="panel" aria-label="Board settings">
-        {selectedPlayer && (
-          <div className="card card-player">
-            <div className="card-head">
-              <h2>Player</h2>
-              <button type="button" className="link-btn" onClick={() => setSelected(null)}>
-                Done
-              </button>
-            </div>
-            <div className="field-row">
-              <label className="field field-num">
-                <span>No.</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={99}
-                  value={selectedPlayer.num}
-                  onFocus={remember}
-                  onChange={(e) => {
-                    const num = Math.max(0, Math.min(99, Number(e.target.value) || 0));
-                    setBoard((b) => ({ ...b, players: b.players.map((p) => (p.id === selectedPlayer.id ? { ...p, num } : p)) }));
-                  }}
-                />
-              </label>
-              <label className="field">
-                <span>Name</span>
-                <input
-                  value={selectedPlayer.name}
-                  maxLength={24}
-                  placeholder="Optional"
-                  autoFocus
-                  onFocus={remember}
-                  onChange={(e) =>
-                    setBoard((b) => ({
-                      ...b,
-                      players: b.players.map((p) => (p.id === selectedPlayer.id ? { ...p, name: e.target.value } : p)),
-                    }))
-                  }
-                />
-              </label>
-            </div>
-          </div>
-        )}
-
-        <div className="panel-tabs" role="tablist" aria-label="Panel">
-          <button type="button" role="tab" aria-selected={tab === "teams"} onClick={() => setTab("teams")}>
-            Teams
-          </button>
-          <button type="button" role="tab" aria-selected={tab === "analysis"} onClick={() => setTab("analysis")}>
-            Analysis
-            {Object.values(board.overlays).some(Boolean) && <span className="tab-dot" aria-hidden="true" />}
-          </button>
-        </div>
-
-        {tab === "teams" &&
-          (["home", "away"] as Team[]).map((team) => {
-            const t = board[team];
-            const shown = team === "home" || board.away.shown;
-            return (
-              <div key={team} className={`card${shown ? "" : " is-off"}`}>
-                <div className="card-head">
-                  <span className="team-dot" style={{ background: t.color }} aria-hidden="true" />
-                  <input
-                    className="team-name"
-                    value={t.name}
-                    maxLength={24}
-                    aria-label={`${team === "home" ? "Home" : "Away"} team name`}
-                    onFocus={remember}
-                    onChange={(e) => setBoard((b) => ({ ...b, [team]: { ...b[team], name: e.target.value } }))}
-                  />
-                  {team === "away" && (
-                    <label className="switch">
-                      <input type="checkbox" checked={board.away.shown} onChange={(e) => setTeam("away", { shown: e.target.checked })} />
-                      <span>Show</span>
-                    </label>
-                  )}
-                </div>
-                <div className="formations" role="group" aria-label={`${t.name} formation`}>
-                  {FORMATION_NAMES.map((f) => (
-                    <button
-                      key={f}
-                      type="button"
-                      className="chip"
-                      aria-pressed={t.formation === f}
-                      disabled={!shown || busy}
-                      data-team={team}
-                      data-formation={f}
-                      onClick={pickFormation}
-                    >
-                      {f}
-                    </button>
-                  ))}
-                </div>
-                <div className="swatches" role="group" aria-label={`${t.name} shirt colour`}>
-                  {TEAM_COLORS.map((c) => (
-                    <button
-                      key={c}
-                      type="button"
-                      className="swatch"
-                      style={{ background: c }}
-                      aria-label={`Colour ${c}`}
-                      aria-pressed={t.color === c}
-                      disabled={!shown}
-                      onClick={() => setTeam(team, { color: c })}
-                    />
-                  ))}
-                </div>
-              </div>
-            );
-          })}
-
-        {tab === "analysis" && <AnalysisPanel board={board} analysis={analysis} onToggle={toggleOverlay} />}
-
-        <div className="card card-actions">
-          <button type="button" className="btn btn-ink" onClick={share} disabled={busy}>
-            Copy share link
-          </button>
-          <div className="actions-pair">
-            <button type="button" className="btn btn-line" onClick={savePng} disabled={busy}>
-              Save image
-            </button>
-            <button
-              type="button"
-              className="btn btn-line"
-              onClick={saveVideo}
-              disabled={busy || steps < 2}
-              title={steps < 2 ? "Add a second step to make a video" : "Record the move as a video"}
-            >
-              {busy ? `${Math.round((recording ?? 0) * 100)}%` : "Save video"}
-            </button>
-          </div>
-          <div className="actions-row">
-            <button type="button" className="btn btn-quiet" onClick={undo} disabled={!canUndo || busy}>
-              Undo
-            </button>
-            <button
-              type="button"
-              className="btn btn-quiet"
-              disabled={busy || (board.drawings.length === 0 && board.zones.length === 0 && board.marks.length === 0)}
-              onClick={() => change((b) => ({ ...b, drawings: [], zones: [], marks: [] }))}
-            >
-              Clear marks
-            </button>
-            <button
-              type="button"
-              className="btn btn-quiet"
-              disabled={busy}
-              onClick={() => {
-                stop();
-                change(defaultBoard());
-                setStep(0);
-                setSelected(null);
-                window.history.replaceState(null, "", window.location.pathname);
-              }}
-            >
-              New board
-            </button>
-          </div>
           <p className="saved-note">Saved on this device as you go.</p>
-        </div>
-      </aside>
+        </aside>
+      </div>
 
       <div className={`toast${toast ? " is-on" : ""}`} role="status" aria-live="polite">
         {toast}
